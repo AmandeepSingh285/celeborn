@@ -1371,6 +1371,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     get(WORKER_GRACEFUL_SHUTDOWN_SAVE_COMMITTED_FILEINFO_SYNC)
   def workerGracefulShutdownDbDeleteFailurePolicy: String =
     get(WORKER_GRACEFUL_SHUTDOWN_DB_DELETE_FAILURE_POLICY)
+  def workerMetadataFailureMode: String = get(WORKER_METADATA_FAILURE_MODE)
 
   // //////////////////////////////////////////////////////
   //                      Flusher                        //
@@ -4016,6 +4017,16 @@ object CelebornConf extends Logging {
       .transform(_.toUpperCase(Locale.ROOT))
       .checkValues(Set("THROW", "EXIT", "IGNORE"))
       .createWithDefault("IGNORE")
+
+  val WORKER_METADATA_FAILURE_MODE: ConfigEntry[String] =
+    buildConf("celeborn.worker.metadata.failureMode")
+      .categories("worker")
+      .doc("Policy to handle rocksdb failures. THROW: throw exception (default), RESTART: recreate instance of RocksDB.")
+      .version("0.7.0")
+      .stringConf
+      .transform(_.toUpperCase(Locale.ROOT))
+      .checkValues(Set("THROW", "RESTART"))
+      .createWithDefault("THROW")
 
   val WORKER_DISKTIME_SLIDINGWINDOW_SIZE: ConfigEntry[Int] =
     buildConf("celeborn.worker.flusher.diskTime.slidingWindow.size")

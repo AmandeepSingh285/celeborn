@@ -35,6 +35,7 @@ class WorkerSource(conf: CelebornConf) extends AbstractSource(conf, Role.WORKER)
   val appActiveConnections: ConcurrentHashMap[String, util.Set[String]] =
     JavaUtils.newConcurrentHashMap[String, util.Set[String]]
   private val metricsAppLevelEnabled = conf.metricsWorkerAppLevelEnabled
+  private val metadataFailureMode = conf.workerMetadataFailureMode
 
   import WorkerSource._
   // add counters
@@ -150,6 +151,8 @@ class WorkerSource(conf: CelebornConf) extends AbstractSource(conf, Role.WORKER)
         applicationIds.asScala.foreach(applicationId => connectionAppIds.remove(applicationId)))
     }
   }
+
+  def workerMetadataFailureMode(): String = metadataFailureMode
 
   // start cleaner thread
   startCleaner()

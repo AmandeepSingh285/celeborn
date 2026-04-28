@@ -17,10 +17,18 @@
 
 package org.apache.celeborn.service.deploy.worker.shuffledb;
 
+import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.rocksdb.RocksDBException;
 import org.rocksdb.WriteOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.celeborn.common.metrics.source.AbstractSource;
+import org.apache.celeborn.service.deploy.worker.WorkerSource;
 
 /**
  * RocksDB implementation of the local KV storage used to persist the shuffle state.
@@ -28,32 +36,78 @@ import org.rocksdb.WriteOptions;
  * <p>Note: code copied from Apache Spark.
  */
 public class RocksDB implements DB {
-  private final org.rocksdb.RocksDB db;
+  private volatile org.rocksdb.RocksDB db;
   private final WriteOptions SYNC_WRITE_OPTIONS = new WriteOptions().setSync(true);
+  private final File dbFile;
+  private final StoreVersion version;
+  private final AbstractSource source;
+  private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
 
-  public RocksDB(org.rocksdb.RocksDB db) {
+  private static final Logger logger = LoggerFactory.getLogger(RocksDB.class);
+
+  public RocksDB(org.rocksdb.RocksDB db, File dbFile, StoreVersion version, AbstractSource source) {
     this.db = db;
+    this.dbFile = dbFile;
+    this.version = version;
+    this.source = source;
+  }
+
+  private void recreateDBInstance() {
+    rwLock.writeLock().lock();
+    try {
+      try {
+        if (db != null) {
+          db.close();
+        }
+      } catch (Exception e) {
+        logger.warn("Failed to close RocksDB instance", e);
+      }
+
+      db = RocksDBProvider.initRockDB(dbFile, version);
+    } catch (IOException e) {
+      logger.warn("Failed to recreate RocksDB instance", e);
+    } finally {
+      rwLock.writeLock().unlock();
+    }
   }
 
   @Override
   public void put(byte[] key, byte[] value) {
     try {
-      db.put(key, value);
+      rwLock.readLock().lock();
+      try {
+        db.put(key, value);
+      } finally {
+        rwLock.readLock().unlock();
+      }
     } catch (RocksDBException e) {
-      throw new RuntimeException(e);
+      if (source instanceof WorkerSource
+              && "THROW".equals(((WorkerSource) source).workerMetadataFailureMode())) {
+        throw new RuntimeException(e);
+      }
+      recreateDBInstance();
     }
   }
 
   @Override
   public void put(byte[] key, byte[] value, boolean sync) {
     try {
-      if (sync) {
-        db.put(SYNC_WRITE_OPTIONS, key, value);
-      } else {
-        db.put(key, value);
+      rwLock.readLock().lock();
+      try {
+        if (sync) {
+          db.put(SYNC_WRITE_OPTIONS, key, value);
+        } else {
+          db.put(key, value);
+        }
+      } finally {
+        rwLock.readLock().unlock();
       }
     } catch (RocksDBException e) {
-      throw new RuntimeException(e);
+      if (source instanceof WorkerSource
+              && "THROW".equals(((WorkerSource) source).workerMetadataFailureMode())) {
+        throw new RuntimeException(e);
+      }
+      recreateDBInstance();
     }
   }
 
@@ -69,9 +123,18 @@ public class RocksDB implements DB {
   @Override
   public void delete(byte[] key) {
     try {
-      db.delete(key);
+      rwLock.readLock().lock();
+      try {
+        db.delete(key);
+      } finally {
+        rwLock.readLock().unlock();
+      }
     } catch (RocksDBException e) {
-      throw new RuntimeException(e);
+      if (source instanceof WorkerSource
+              && "THROW".equals(((WorkerSource) source).workerMetadataFailureMode())) {
+        throw new RuntimeException(e);
+      }
+      recreateDBInstance();
     }
   }
 
