@@ -116,7 +116,16 @@ public class RocksDB implements DB {
     try {
       return db.get(key);
     } catch (RocksDBException e) {
-      throw new RuntimeException(e);
+      if (source instanceof WorkerSource
+              && "THROW".equals(((WorkerSource) source).workerMetadataFailureMode())) {
+        throw new RuntimeException(e);
+      }
+      recreateDBInstance();
+      try {
+        return db.get(key);
+      } catch (RocksDBException e2) {
+        throw new RuntimeException(e2);
+      }
     }
   }
 

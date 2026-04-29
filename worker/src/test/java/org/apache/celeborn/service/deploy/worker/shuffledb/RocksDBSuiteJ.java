@@ -50,7 +50,9 @@ import org.apache.celeborn.service.deploy.worker.WorkerSource;
 public class RocksDBSuiteJ {
 
     private static final String RESTART_FAILURE_MODE = "RESTART";
-    private static final String METADATA_DB_FAIL_MODE_KEY = "celeborn.worker.metadata.db.fail.mode";
+    // celeborn.common.CelebornConf.WORKER_METADATA_FAILURE_MODE
+    private static final String WORKER_METADATA_FAILURE_MODE_KEY =
+            "celeborn.worker.metadata.failureMode";
 
     private File dbDir;
     private StoreVersion version;
@@ -63,7 +65,7 @@ public class RocksDBSuiteJ {
         FileUtils.forceMkdir(dbDir);
         version = new StoreVersion(1, 0);
         CelebornConf restartConf = new CelebornConf();
-        restartConf.set(METADATA_DB_FAIL_MODE_KEY, RESTART_FAILURE_MODE);
+        restartConf.set(WORKER_METADATA_FAILURE_MODE_KEY, RESTART_FAILURE_MODE);
         restartSource = new WorkerSource(restartConf);
         ignoreSource = new WorkerSource(new CelebornConf());
     }
