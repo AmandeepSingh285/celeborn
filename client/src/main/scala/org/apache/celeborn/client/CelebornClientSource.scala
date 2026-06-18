@@ -51,22 +51,15 @@ class CelebornClientSource(conf: CelebornConf) extends AbstractSource(conf, Role
 }
 
 object CelebornClientSource {
-  // worker health
   val EXCLUDED_WORKER_COUNT = "ClientExcludedWorkerCount"
   val SHUTTING_WORKER_COUNT = "ClientShuttingWorkerCount"
-
-  // shuffle lifecycle
   val ACTIVE_SHUFFLE_COUNT = "ClientActiveShuffleCount"
   val REGISTER_SHUFFLE_COUNT = "ClientRegisterShuffleCount"
   val REGISTER_SHUFFLE_FAIL_COUNT = "ClientRegisterShuffleFailCount"
   val UNREGISTER_SHUFFLE_COUNT = "ClientUnregisterShuffleCount"
-
-  // write path
   val REVIVE_REQUEST_COUNT = "ClientReviveRequestCount"
   val REVIVE_FAIL_COUNT = "ClientReviveFailCount"
   val SLOT_RESERVATION_FAIL_COUNT = "ClientSlotReservationFailCount"
-
-  // data integrity
   val SHUFFLE_FETCH_FAILURE_COUNT = "ClientShuffleFetchFailureCount"
   val SHUFFLE_DATA_LOST_COUNT = "ClientShuffleDataLostCount"
 }
