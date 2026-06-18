@@ -18,7 +18,7 @@
 package org.apache.celeborn.service.deploy.master
 
 import java.util.{Map => JMap}
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.JavaConverters._
 
@@ -28,79 +28,46 @@ import org.apache.celeborn.common.metrics.{ClientMetric, MetricType}
 import org.apache.celeborn.common.metrics.source.{AbstractSource, Role}
 import org.apache.celeborn.common.util.JavaUtils
 
-/**
- * Holds the client-side metrics that applications report in their heartbeat and re-exposes them on
- * the master's Prometheus endpoint, labeled by `applicationId`. Both the registrations and any
- * cached state are dropped when the application is terminated.
- */
 class ApplicationMetricsSource(conf: CelebornConf)
   extends AbstractSource(conf, Role.MASTER) with Logging {
   override val sourceName = "application"
 
-  // applicationId -> (metricName -> latest reported gauge value)
-  private val appGaugeCache =
-    JavaUtils.newConcurrentHashMap[String, ConcurrentHashMap[String, java.lang.Long]]()
+  private val masterClientMetricsEnabled = conf.masterClientMetricsEnabled
 
-  // applicationId -> (metricName -> last reported counter value, used to compute deltas)
-  private val appCounterPrev =
-    JavaUtils.newConcurrentHashMap[String, ConcurrentHashMap[String, java.lang.Long]]()
+  private val gaugeValues =
+    JavaUtils.newConcurrentHashMap[(Map[String, String], String), AtomicLong]()
 
-  startCleaner()
+  def updateApplicationMetrics(
+      metricLabels: Map[String, String],
+      metrics: JMap[String, ClientMetric]): Unit = {
+    if (!masterClientMetricsEnabled || metricLabels.isEmpty) {
+      return
+    }
 
-  def updateApplicationMetrics(appId: String, metrics: JMap[String, ClientMetric]): Unit = {
-    if (metrics.isEmpty) return
     metrics.asScala.foreach { case (name, metric) =>
-      val labels = Map(applicationLabel -> appId)
       metric.metricType match {
-        case MetricType.Gauge => updateGauge(appId, name, labels, metric.value)
-        case MetricType.Counter => updateCounter(appId, name, labels, metric.value)
+        case MetricType.Gauge => updateGauge(metricLabels, name, metric.value)
+        case MetricType.Counter => updateCounter(metricLabels, name, metric.value)
       }
     }
   }
 
-  private def updateGauge(
-      appId: String,
-      name: String,
-      labels: Map[String, String],
-      value: Long): Unit = {
-    val cache = appGaugeCache.computeIfAbsent(appId, _ => JavaUtils.newConcurrentHashMap())
-    cache.put(name, value)
-    if (!gaugeExists(name, labels)) {
-      addGauge(name, labels) { () =>
-        Option(appGaugeCache.get(appId))
-          .flatMap(m => Option(m.get(name)))
-          .map(_.longValue())
-          .getOrElse(0L)
-      }
-    }
+  private def updateGauge(labels: Map[String, String], name: String, value: Long): Unit = {
+    val ref = gaugeValues.computeIfAbsent(
+      (labels, name),
+      _ => {
+        val r = new AtomicLong(0L)
+        addGauge(name, labels) { () => r.get() }
+        r
+      })
+    ref.set(value)
   }
 
-  private def updateCounter(
-      appId: String,
-      name: String,
-      labels: Map[String, String],
-      newValue: Long): Unit = {
-    val prev = appCounterPrev.computeIfAbsent(appId, _ => JavaUtils.newConcurrentHashMap())
+  private def updateCounter(labels: Map[String, String], name: String, delta: Long): Unit = {
+    if (delta <= 0) return
     if (!counterExists(name, labels)) {
       addCounter(name, labels)
     }
-    val prevValue = prev.getOrDefault(name, 0L)
-    val delta = newValue - prevValue
-    if (delta > 0) {
-      incCounter(name, delta, labels)
-    }
-    prev.put(name, newValue)
-  }
-
-  def removeApplicationMetrics(appId: String): Unit = {
-    val labels = Map(applicationLabel -> appId)
-    val gaugeCache = appGaugeCache.remove(appId)
-    if (gaugeCache != null) {
-      gaugeCache.keySet().asScala.foreach(name => removeGauge(name, labels))
-    }
-    val counterPrev = appCounterPrev.remove(appId)
-    if (counterPrev != null) {
-      counterPrev.keySet().asScala.foreach(name => removeCounter(name, labels))
-    }
+    incCounter(name, delta, labels)
   }
 }

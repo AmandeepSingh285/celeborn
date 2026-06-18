@@ -911,12 +911,15 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def metricsConf: Option[String] = get(METRICS_CONF)
   def metricsSystemEnable: Boolean = get(METRICS_ENABLED)
   def clientMetricsEnabled: Boolean = get(CLIENT_METRICS_ENABLED)
+  def masterClientMetricsEnabled: Boolean = get(MASTER_CLIENT_METRICS_ENABLED)
   def metricsSampleRate: Double = get(METRICS_SAMPLE_RATE)
   def metricsSlidingWindowSize: Int = get(METRICS_SLIDING_WINDOW_SIZE)
   def metricsCollectCriticalEnabled: Boolean = get(METRICS_COLLECT_CRITICAL_ENABLED)
   def metricsCapacity: Int = get(METRICS_CAPACITY)
   def metricsExtraLabels: Map[String, String] =
     get(METRICS_EXTRA_LABELS).map(Utils.parseKeyValuePair).toMap
+  def clientMetricsAppLabels: Map[String, String] =
+    get(CLIENT_METRICS_APP_LABELS).map(Utils.parseKeyValuePair).toMap
   def metricsWorkerAppTopResourceConsumptionCount: Int =
     get(METRICS_WORKER_APP_TOP_RESOURCE_CONSUMPTION_COUNT)
   def metricsWorkerAppTopResourceConsumptionBytesWrittenThreshold: Long =
@@ -5919,6 +5922,18 @@ object CelebornConf extends Logging {
       .booleanConf
       .createWithDefault(false)
 
+  val MASTER_CLIENT_METRICS_ENABLED: ConfigEntry[Boolean] =
+    buildConf("celeborn.metrics.master.clientMetrics.enabled")
+      .categories("metrics")
+      .doc("When true, the master re-exposes client-side metrics forwarded in application " +
+        "heartbeats on its Prometheus endpoint. Disabled by default because the metrics are " +
+        "per-label-set (not per-applicationId) and can produce unbounded cardinality if many " +
+        "distinct label combinations are used. Requires `celeborn.client.metrics.enabled` and " +
+        "non-empty `celeborn.client.metrics.appLabels` on the client side to have any effect.")
+      .version("0.7.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val METRICS_SAMPLE_RATE: ConfigEntry[Double] =
     buildConf("celeborn.metrics.sample.rate")
       .categories("metrics")
@@ -5958,6 +5973,23 @@ object CelebornConf extends Logging {
       .doc("If default metric labels are not enough, extra metric labels can be customized. " +
         "Labels' pattern is: `<label1_key>=<label1_value>[,<label2_key>=<label2_value>]*`; e.g. `env=prod,version=1`")
       .version("0.3.0")
+      .stringConf
+      .toSequence
+      .checkValue(
+        labels => labels.map(_ => Try(Utils.parseKeyValuePair(_))).forall(_.isSuccess),
+        "Allowed pattern is: `<label1_key>=<label1_value>[,<label2_key>=<label2_value>]*`")
+      .createWithDefault(Seq.empty)
+
+  val CLIENT_METRICS_APP_LABELS: ConfigEntry[Seq[String]] =
+    buildConf("celeborn.client.metrics.appLabels")
+      .categories("client", "metrics")
+      .doc("Custom metric labels sent from the client in each application heartbeat and applied " +
+        "to client metrics re-exposed on the master's Prometheus endpoint. " +
+        "Labels' pattern is: `<label1_key>=<label1_value>[,<label2_key>=<label2_value>]*`; " +
+        "e.g. `team=data-eng,env=prod`. Multiple applications sharing the same label set are " +
+        "aggregated into a single time series. When empty, the master uses `applicationId=default`. " +
+        "Prefer this over the default applicationId tag, which is high cardinality.")
+      .version("0.6.0")
       .stringConf
       .toSequence
       .checkValue(
