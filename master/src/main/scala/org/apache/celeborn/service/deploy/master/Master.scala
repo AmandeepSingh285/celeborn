@@ -1157,6 +1157,7 @@ private[celeborn] class Master(
         workersAssignedToApp.remove(appId)
         statusSystem.handleAppLost(appId, requestId)
         quotaManager.handleAppLost(appId)
+        applicationMetricsSource.removeApplicationMetrics(appId)
         logInfo(s"Removed application $appId")
         if (remoteStorageDirs.isDefined) {
           checkAndCleanExpiredAppDirsOnDFS(appId)
@@ -1247,7 +1248,7 @@ private[celeborn] class Master(
       applicationFallbackCounts,
       System.currentTimeMillis(),
       requestId)
-    applicationMetricsSource.updateApplicationMetrics(metricLabels.asScala.toMap, clientMetrics)
+    applicationMetricsSource.updateApplicationMetrics(appId, metricLabels.asScala.toMap, clientMetrics)
     gaugeShuffleFallbackCounts()
     val unknownWorkers = needCheckedWorkerList.asScala.filterNot(w =>
       statusSystem.workersMap.containsKey(w.toUniqueId)).asJava

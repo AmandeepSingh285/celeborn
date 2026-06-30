@@ -44,15 +44,15 @@ class CelebornClientSource(conf: CelebornConf) extends AbstractSource(conf, Role
   addCounter(SHUFFLE_DATA_LOST_COUNT)
 
   def getMetricsSnapshot(): Map[String, ClientMetric] = {
-    // Counters: compute delta since last snapshot so the master can simply accumulate.
+    // Counters: compute delta since last snapshot
     val counterMetrics = counters().flatMap { c =>
       val current = c.counter.getCount
-      val prev = Option(counterPrev.put(c.name, current)).getOrElse(0L)
+      val prev = Option(counterPrev.put(c.name, current)).map(_.longValue()).getOrElse(0L)
       val delta = current - prev
       if (delta > 0) Some(c.name -> ClientMetric(delta, MetricType.Counter))
       else None
     }
-    // Gauges: send the latest value as-is.
+
     val gaugeMetrics = gauges().map(g =>
       g.name -> ClientMetric(g.gauge.getValue.asInstanceOf[Number].longValue(), MetricType.Gauge))
     (counterMetrics ++ gaugeMetrics).toMap

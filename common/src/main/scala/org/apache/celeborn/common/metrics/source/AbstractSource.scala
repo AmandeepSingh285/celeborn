@@ -19,6 +19,7 @@ package org.apache.celeborn.common.metrics.source
 
 import java.util.{Map => JMap}
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -47,6 +48,30 @@ case class NamedHistogram(name: String, histogram: Histogram, labels: Map[String
   extends MetricLabels
 
 case class NamedTimer(name: String, timer: Timer, labels: Map[String, String]) extends MetricLabels
+
+// A Gauge whose value can be updated after registration. Backed by an AtomicLong for
+// thread-safe reads and writes without needing an external value holder.
+class SettableGauge(initialValue: Long = 0L) extends Gauge[Long] {
+  private val value = new AtomicLong(initialValue)
+  override def getValue: Long = value.get()
+  def set(v: Long): Unit = value.set(v)
+}
+
+// Per-app tracking for a dynamically-registered gauge. Wraps the NamedGauge that is already
+// registered in namedGauges, plus the set of appIds contributing to this metric. Original labels
+// (pre-customization) are kept for deregistration via removeGauge(name, labels).
+case class NamedGaugeDetails[T](
+    namedGauge: NamedGauge[T],
+    originalLabels: Map[String, String],
+    appIds: java.util.Set[String])
+
+// Per-app tracking for a dynamically-registered counter. Wraps the NamedCounter that is already
+// registered in namedCounters, plus the set of appIds contributing to this metric. Original labels
+// (pre-customization) are kept for deregistration via removeCounter(name, labels).
+case class NamedCounterDetails(
+    namedCounter: NamedCounter,
+    originalLabels: Map[String, String],
+    appIds: java.util.Set[String])
 
 abstract class AbstractSource(conf: CelebornConf, role: String)
   extends Source with Logging {
@@ -87,6 +112,14 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
 
   protected val namedGauges: ConcurrentHashMap[String, NamedGauge[_]] =
     JavaUtils.newConcurrentHashMap[String, NamedGauge[_]]()
+
+  // For dynamically-registered per-app metrics: tracks backing value + contributing appIds.
+  // Keyed by the same metricNameWithLabel string used in namedGauges/namedCounters.
+  protected val namedGaugesWithDetails: ConcurrentHashMap[String, NamedGaugeDetails[Long]] =
+    JavaUtils.newConcurrentHashMap[String, NamedGaugeDetails[Long]]()
+
+  protected val namedCountersWithDetails: ConcurrentHashMap[String, NamedCounterDetails] =
+    JavaUtils.newConcurrentHashMap[String, NamedCounterDetails]()
 
   protected val namedTimers
       : ConcurrentHashMap[String, (NamedTimer, ConcurrentHashMap[String, Long])] =
@@ -281,6 +314,86 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
     val metricNameWithLabel = metricNameWithCustomizedLabels(name, labels)
     metricRegistry.remove(metricNameWithLabel)
     metricNameWithLabel
+  }
+
+  /**
+   * Register a gauge for the given app (if not yet registered) and update its value. The gauge
+   * uses a SettableGauge so the value can be updated without re-registration. The appId is
+   * recorded so the gauge can be deregistered once all contributing apps are gone.
+   */
+  protected def addOrUpdateGaugeForApp(
+      name: String,
+      labels: Map[String, String],
+      appId: String,
+      value: Long): Unit = {
+    val metricKey = metricNameWithCustomizedLabels(name, labels)
+    val details = namedGaugesWithDetails.computeIfAbsent(
+      metricKey,
+      (_: String) => {
+        val gauge = addSettableGauge(name, labels)
+        val namedGauge = namedGauges.get(metricKey).asInstanceOf[NamedGauge[Long]]
+        NamedGaugeDetails(namedGauge, labels, ConcurrentHashMap.newKeySet[String]())
+      })
+    details.appIds.add(appId)
+    details.namedGauge.gauge.asInstanceOf[SettableGauge].set(value)
+  }
+
+  /**
+   * Register a counter for the given app (if not yet registered) and increment it by delta.
+   * The appId is recorded so the counter can be deregistered once all contributing apps are gone.
+   * Non-positive deltas are ignored.
+   */
+  protected def addOrUpdateCounterForApp(
+      name: String,
+      labels: Map[String, String],
+      appId: String,
+      delta: Long): Unit = {
+    if (delta <= 0) return
+    val metricKey = metricNameWithCustomizedLabels(name, labels)
+    val details = namedCountersWithDetails.computeIfAbsent(
+      metricKey,
+      (_: String) => {
+        addCounter(name, labels)
+        val namedCounter = namedCounters.get(metricKey)
+        NamedCounterDetails(namedCounter, labels, ConcurrentHashMap.newKeySet[String]())
+      })
+    details.appIds.add(appId)
+    incCounter(name, delta, labels)
+  }
+
+  /**
+   * Remove the given appId from all tracked gauges and counters. Any metric whose appId set
+   * becomes empty is deregistered via the standard removeGauge/removeCounter path.
+   */
+  protected def removeAppFromMetrics(appId: String): Unit = {
+    val gaugeIter = namedGaugesWithDetails.entrySet().iterator()
+    while (gaugeIter.hasNext) {
+      val entry = gaugeIter.next()
+      val details = entry.getValue
+      details.appIds.remove(appId)
+      if (details.appIds.isEmpty) {
+        gaugeIter.remove()
+        removeGauge(details.namedGauge.name, details.originalLabels)
+      }
+    }
+
+    val counterIter = namedCountersWithDetails.entrySet().iterator()
+    while (counterIter.hasNext) {
+      val entry = counterIter.next()
+      val details = entry.getValue
+      details.appIds.remove(appId)
+      if (details.appIds.isEmpty) {
+        counterIter.remove()
+        removeCounter(details.namedCounter.name, details.originalLabels)
+      }
+    }
+  }
+
+  // Registers a SettableGauge and returns it so callers can update the value after registration.
+  protected def addSettableGauge(name: String, labels: Map[String, String]): SettableGauge = {
+    val gauge = new SettableGauge()
+    addGauge(name, labels, gauge)
+    gauge
   }
 
   override def sample[T](metricsName: String, key: String)(f: => T): T = {
@@ -697,6 +810,8 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
     metricsCleaner.shutdown()
     namedCounters.clear()
     namedGauges.clear()
+    namedGaugesWithDetails.clear()
+    namedCountersWithDetails.clear()
     namedMeters.clear()
     namedTimers.clear()
     timerMetrics.clear()
