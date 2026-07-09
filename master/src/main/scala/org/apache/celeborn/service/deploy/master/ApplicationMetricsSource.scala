@@ -19,6 +19,7 @@ package org.apache.celeborn.service.deploy.master
 
 import java.util.{Map => JMap}
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.JavaConverters._
 
@@ -38,6 +39,21 @@ class ApplicationMetricsSource(conf: CelebornConf)
   // Tracking applications that have been terminated
   private val removedAppIds =
     JavaUtils.newConcurrentHashMap[String, java.lang.Long]()
+
+  // Serializes the removed-app gate check + metric registration in updateApplicationMetrics
+  // against removeApplicationMetrics. Without this, a heartbeat could read removedAppIds as
+  // "not removed", get preempted by a full app-lost removal, and then re-register a dead app's
+  // series that is now gated in removedAppIds and would never be deregistered again (leak).
+  private val metricsUpdateLock = new Object()
+
+  // Metric series are keyed only by their (low-cardinality) label set, and are only reclaimed on
+  // app-lost. High-cardinality operator-supplied appLabels therefore have no upper bound on the
+  // number of distinct series; on a master failover the in-memory removedAppIds tombstones are
+  // lost as well. Warn (once) if the number of tracked series grows unexpectedly large so that a
+  // mis-configured, high-cardinality label set is visible instead of silently leaking memory.
+  private val seriesCardinalityWarnThreshold =
+    ApplicationMetricsSource.SERIES_CARDINALITY_WARN_THRESHOLD
+  private val cardinalityWarned = new AtomicBoolean(false)
 
   if (masterClientMetricsEnabled) {
     startRemovedAppCleaner()
@@ -65,24 +81,52 @@ class ApplicationMetricsSource(conf: CelebornConf)
       appId: String,
       metricLabels: Map[String, String],
       metrics: JMap[String, ClientMetric]): Unit = {
-    if (!masterClientMetricsEnabled || metricLabels.isEmpty || removedAppIds.containsKey(appId)) {
+    if (!masterClientMetricsEnabled || metricLabels.isEmpty) {
       return
     }
 
-    metrics.asScala.foreach { case (name, metric) =>
-      metric.metricType match {
-        case MetricType.Gauge =>
-          addOrUpdateGaugeForApp(name, metricLabels, appId, metric.value)
-        case MetricType.Counter =>
-          addOrUpdateCounterForApp(name, metricLabels, appId, metric.value)
+    // Hold the lock across the gate check and the registration so this is atomic relative to
+    // removeApplicationMetrics; otherwise a concurrent removal could slip in between the check
+    // and the registration and leave a dead app's series permanently registered.
+    metricsUpdateLock.synchronized {
+      if (removedAppIds.containsKey(appId)) {
+        return
+      }
+      metrics.asScala.foreach { case (name, metric) =>
+        metric.metricType match {
+          case MetricType.Gauge =>
+            addOrUpdateGaugeForApp(name, metricLabels, appId, metric.value)
+          case MetricType.Counter =>
+            addOrUpdateCounterForApp(name, metricLabels, appId, metric.value)
+        }
       }
     }
+    warnIfSeriesCardinalityHigh()
   }
 
-  def removeApplicationMetrics(appId: String): Unit = {
+  def removeApplicationMetrics(appId: String): Unit = metricsUpdateLock.synchronized {
     if (masterClientMetricsEnabled) {
       removedAppIds.put(appId, System.currentTimeMillis())
     }
     removeAppFromMetrics(appId)
   }
+
+  private def warnIfSeriesCardinalityHigh(): Unit = {
+    val trackedSeries = gauges().size + counters().size
+    val shouldWarn = trackedSeries > seriesCardinalityWarnThreshold &&
+      cardinalityWarned.compareAndSet(false, true)
+    if (shouldWarn) {
+      logWarning(
+        s"Client metrics are tracking $trackedSeries distinct series, exceeding " +
+          s"$seriesCardinalityWarnThreshold. Client metric series are keyed by " +
+          s"'${CelebornConf.CLIENT_METRICS_APP_LABELS.key}' and are only reclaimed when an " +
+          "application is lost, so high-cardinality labels can grow memory without bound. " +
+          "Ensure these labels are low-cardinality (e.g. env/team), not per-application values.")
+    }
+  }
+}
+
+object ApplicationMetricsSource {
+  // Heuristic threshold for warning about high client-metric series cardinality.
+  val SERIES_CARDINALITY_WARN_THRESHOLD = 1000
 }

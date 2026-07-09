@@ -5973,9 +5973,10 @@ object CelebornConf extends Logging {
 
   val CLIENT_METRICS_ENABLED: ConfigEntry[Boolean] =
     buildConf("celeborn.client.metrics.enabled")
-      .categories("metrics")
+      .categories("client", "metrics")
       .doc("When true, the LifecycleManager collects client-side metrics. " +
-        "Requires `celeborn.metrics.enabled` to also be true.")
+        "Requires `celeborn.metrics.enabled` to also be true. Note that client metrics are only " +
+        "emitted in application heartbeats when `celeborn.client.metrics.appLabels` is set.")
       .version("0.7.0")
       .booleanConf
       .createWithDefault(false)
@@ -5990,13 +5991,13 @@ object CelebornConf extends Logging {
       .createWithDefault(false)
 
   val MASTER_CLIENT_METRICS_REMOVED_APP_RETENTION: ConfigEntry[Long] =
-    buildConf("celeborn.metrics.master.clientMetrics.removedApp.retentionMs")
+    buildConf("celeborn.metrics.master.clientMetrics.removedApp.retention")
       .categories("metrics")
       .doc("How long to retain removed application IDs in the client metrics source to " +
         "reject late heartbeats after an application is lost. Entries older than this are " +
         "periodically evicted.")
       .version("0.7.0")
-      .timeConf(TimeUnit.MILLISECONDS)
+      .timeConf(TimeUnit.MINUTES)
       .createWithDefaultString("5min")
 
   val METRICS_SAMPLE_RATE: ConfigEntry[Double] =

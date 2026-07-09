@@ -53,7 +53,7 @@ case class AppMetricDetails[T](
     name: String,
     handle: T,
     originalLabels: Map[String, String],
-    additionalDetails: java.util.Set[String])
+    contributingAppIds: java.util.Set[String])
 
 abstract class AbstractSource(conf: CelebornConf, role: String)
   extends Source with Logging {
@@ -113,6 +113,14 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
 
   protected val namedCountersWithDetails: ConcurrentHashMap[String, AppMetricDetails[Counter]] =
     JavaUtils.newConcurrentHashMap[String, AppMetricDetails[Counter]]()
+
+  // Serializes mutations of the per-app tracked metric maps (namedGaugesWithDetails /
+  // namedCountersWithDetails), their handles, and their deregistration. Because the Master RPC
+  // endpoint dispatches concurrently, a heartbeat update (addOrUpdate*ForApp) can otherwise
+  // interleave with an app-lost removal (removeAppFromMetrics) for the same label set, which
+  // caused lost increments, transient deregistration, and NPEs. Holding a single lock around
+  // all of these mutations makes them atomic relative to one another.
+  private val trackedMetricsLock = new Object()
 
   def addTimerMetrics(namedTimer: NamedTimer): Unit = {
     val timerMetricsString = getTimerMetrics(namedTimer)
@@ -201,16 +209,20 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
       })
   }
 
-  def addCounter(name: String): Unit = addCounter(name, Map.empty[String, String])
+  def addCounter(name: String): NamedCounter = addCounter(name, Map.empty[String, String])
 
-  def addCounter(name: String, labels: Map[String, String]): Unit = {
+  def addCounter(name: String, labels: Map[String, String]): NamedCounter = {
     val metricNameWithLabel = metricNameWithCustomizedLabels(name, labels)
-    namedCounters.putIfAbsent(
+    // Atomically get-or-create so the returned NamedCounter is guaranteed to be the instance
+    // currently resident in namedCounters. Callers must never re-.get(metricNameWithLabel)
+    // afterwards, since a concurrent removeCounter could have removed it in the meantime.
+    namedCounters.computeIfAbsent(
       metricNameWithLabel,
-      NamedCounter(
-        name,
-        metricRegistry.counter(metricNameWithLabel),
-        labelsWithCustomizedLabels(labels)))
+      (_: String) =>
+        NamedCounter(
+          name,
+          metricRegistry.counter(metricNameWithLabel),
+          labelsWithCustomizedLabels(labels)))
   }
 
   def addHistogram(name: String): Unit = {
@@ -227,11 +239,21 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
         labelsWithCustomizedLabels(labels)))
   }
 
+  /**
+   * Records a gauge value contributed by an application for the given label set.
+   *
+   * Note: gauge aggregation across apps sharing a single label set is last-writer-wins, not a
+   * sum or max. Because appId is intentionally kept only in [[AppMetricDetails.contributingAppIds]]
+   * and never in the metric key, N apps that share a label set collapse to one series, and this
+   * `set(value)` makes the exported gauge reflect whichever app heartbeated most recently. This is
+   * deliberate and differs from counters (which sum). To get per-app gauge values, include a
+   * per-app label so the apps map to distinct series.
+   */
   protected def addOrUpdateGaugeForApp(
       name: String,
       labels: Map[String, String],
       appId: String,
-      value: Long): Unit = {
+      value: Long): Unit = trackedMetricsLock.synchronized {
     val details = namedGaugesWithDetails.computeIfAbsent(
       metricNameWithCustomizedLabels(name, labels),
       (_: String) => {
@@ -239,7 +261,7 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
         addGauge(name, labels)(() => holder.get())
         AppMetricDetails(name, holder, labels, ConcurrentHashMap.newKeySet[String]())
       })
-    details.additionalDetails.add(appId)
+    details.contributingAppIds.add(appId)
     details.handle.set(value)
   }
 
@@ -251,19 +273,21 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
     if (delta <= 0) {
       return
     }
-    val metricKey = metricNameWithCustomizedLabels(name, labels)
-    val details = namedCountersWithDetails.computeIfAbsent(
-      metricKey,
-      (_: String) => {
-        addCounter(name, labels)
-        AppMetricDetails(
-          name,
-          namedCounters.get(metricKey).counter,
-          labels,
-          ConcurrentHashMap.newKeySet[String]())
-      })
-    details.additionalDetails.add(appId)
-    details.handle.inc(delta)
+    trackedMetricsLock.synchronized {
+      val metricKey = metricNameWithCustomizedLabels(name, labels)
+      val details = namedCountersWithDetails.computeIfAbsent(
+        metricKey,
+        (_: String) => {
+          val namedCounter = addCounter(name, labels)
+          AppMetricDetails(
+            name,
+            namedCounter.counter,
+            labels,
+            ConcurrentHashMap.newKeySet[String]())
+        })
+      details.contributingAppIds.add(appId)
+      details.handle.inc(delta)
+    }
   }
 
   def counters(): List[NamedCounter] = {
@@ -335,7 +359,7 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
     metricNameWithLabel
   }
 
-  protected def removeAppFromMetrics(appId: String): Unit = {
+  protected def removeAppFromMetrics(appId: String): Unit = trackedMetricsLock.synchronized {
     removeAppFromTracked(namedGaugesWithDetails, appId)(d => removeGauge(d.name, d.originalLabels))
     removeAppFromTracked(namedCountersWithDetails, appId)(d =>
       removeCounter(d.name, d.originalLabels))
@@ -347,8 +371,8 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
     val iter = tracked.entrySet().iterator()
     while (iter.hasNext) {
       val details = iter.next().getValue
-      details.additionalDetails.remove(appId)
-      if (details.additionalDetails.isEmpty) {
+      details.contributingAppIds.remove(appId)
+      if (details.contributingAppIds.isEmpty) {
         iter.remove()
         deregister(details)
       }
