@@ -5985,7 +5985,7 @@ object CelebornConf extends Logging {
 
   val MASTER_CLIENT_METRICS_ENABLED: ConfigEntry[Boolean] =
     buildConf("celeborn.metrics.master.clientMetrics.enabled")
-      .categories("metrics")
+      .categories("master", "metrics")
       .doc("When true, the master exposes client-side metrics forwarded in application " +
         "heartbeats on its Prometheus endpoint.")
       .version("0.7.0")
@@ -5994,7 +5994,7 @@ object CelebornConf extends Logging {
 
   val MASTER_CLIENT_METRICS_REMOVED_APP_RETENTION: ConfigEntry[Long] =
     buildConf("celeborn.metrics.master.clientMetrics.removedApp.retention")
-      .categories("metrics")
+      .categories("master", "metrics")
       .doc("How long to retain removed application IDs in the client metrics source to " +
         "reject late heartbeats after an application is lost. Entries older than this are " +
         "periodically evicted.")
