@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git diff *)",
+      "Read(//tmp/**)",
+      "Bash(git log *)",
+      "Read(//dev/**)",
+      "Bash(awk '/protected def addOrUpdateGaugeForApp/,/^  }/' common/src/main/scala/org/apache/celeborn/common/metrics/source/AbstractSource.scala)",
+      "Bash(UPDATE=1 timeout 580 build/mvn -q -o clean test -pl common -am -Dtest=none -DwildcardSuites=org.apache.celeborn.ConfigurationSuite)"
+    ]
+  }
+}

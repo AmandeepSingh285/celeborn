@@ -27,12 +27,24 @@ import org.apache.celeborn.common.metrics.source.{AbstractSource, Role}
 class CelebornClientSource(conf: CelebornConf) extends AbstractSource(conf, Role.CLIENT) {
   override val sourceName = "client"
 
+  /**
+   * A full snapshot of this client's metrics, sent to the master on every heartbeat.
+   *
+   * Values are absolute, never deltas since the last heartbeat: a counter reports its
+   * cumulative total since this client process started. The heartbeat transport is
+   * at-least-once and lossy, so an absolute value lets the master replace rather than
+   * accumulate — a redelivered heartbeat is then a no-op and a dropped one is repaired by
+   * the next. `Counter.getCount` is already cumulative for the life of the process.
+   */
   def getMetricsSnapshot(): Map[String, ClientMetric] = {
     val snapshot = Map.newBuilder[String, ClientMetric]
     gauges().foreach { g =>
       snapshot += g.name -> ClientMetric(
         g.gauge.getValue.asInstanceOf[Number].longValue(),
         MetricType.Gauge)
+    }
+    counters().foreach { c =>
+      snapshot += c.name -> ClientMetric(c.counter.getCount, MetricType.Counter)
     }
     snapshot.result()
   }

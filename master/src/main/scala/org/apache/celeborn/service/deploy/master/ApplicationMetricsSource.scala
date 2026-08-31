@@ -25,7 +25,7 @@ import scala.collection.JavaConverters._
 
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.internal.Logging
-import org.apache.celeborn.common.metrics.{ClientMetric, MetricType}
+import org.apache.celeborn.common.metrics.ClientMetric
 import org.apache.celeborn.common.metrics.source.{AbstractSource, Role}
 import org.apache.celeborn.common.util.{JavaUtils, Utils}
 
@@ -42,6 +42,10 @@ class ApplicationMetricsSource(conf: CelebornConf)
   // Tracking applications that have been terminated
   private val removedAppIds =
     JavaUtils.newConcurrentHashMap[String, java.lang.Long]()
+
+  // Last accepted report per application, used to drop delayed heartbeats.
+  private val lastReports =
+    JavaUtils.newConcurrentHashMap[String, ClientReport]()
 
   private val seriesCardinalityWarnThreshold =
     conf.masterClientMetricsSeriesCardinalityWarnThreshold
@@ -69,29 +73,72 @@ class ApplicationMetricsSource(conf: CelebornConf)
       TimeUnit.MILLISECONDS)
   }
 
+  /**
+   * Apply one application's metric report.
+   *
+   * Reported values are absolute, so this is a replace rather than an accumulate and
+   * re-applying the same report is a no-op. `clientInstanceId` identifies the reporting
+   * process so a client restart does not look like a counter going backwards, and
+   * `metricsSeq` lets a delayed report that arrives after a newer one be dropped.
+   */
   def updateApplicationMetrics(
       appId: String,
       metricLabels: Map[String, String],
-      metrics: JMap[String, ClientMetric]): Unit = {
+      metrics: JMap[String, ClientMetric],
+      clientInstanceId: String,
+      metricsSeq: Long): Unit = {
     val reason = rejectReason(appId, metricLabels)
     if (reason != null) {
       logWarning(s"Ignoring client metrics from $appId: $reason")
       return
     }
 
-    metrics.asScala.foreach { case (name, metric) =>
-      metric.metricType match {
-        case MetricType.Gauge =>
-          addOrUpdateGaugeForApp(name, metricLabels, appId, metric.value)
-        case _ =>
-      }
+    if (!acceptReport(appId, clientInstanceId, metricsSeq)) {
+      logDebug(
+        s"Ignoring stale client metrics from $appId (instance '$clientInstanceId', " +
+          s"seq $metricsSeq): a newer report has already been applied.")
+      return
     }
 
-    if (removedAppIds.containsKey(appId)) {
-      removeAppFromMetrics(appId)
+    metrics.asScala.foreach { case (name, metric) =>
+      addOrUpdateMetricForApp(
+        name,
+        metricLabels,
+        appId,
+        clientInstanceId,
+        metric.value,
+        metric.metricType)
     }
 
     warnIfSeriesCardinalityHigh()
+  }
+
+  /**
+   * Whether this report is newer than the last one applied for `appId`.
+   *
+   * A report is stale only if it comes from the *same* client process and does not advance
+   * the sequence; a new process restarts its sequence, so an instance change always wins.
+   * A non-positive sequence means the client does not sequence its reports (an older client,
+   * or one that never enabled metrics), in which case there is nothing to compare and the
+   * report is accepted — behaviour then matches the pre-sequencing implementation.
+   */
+  private def acceptReport(appId: String, instanceId: String, seq: Long): Boolean = {
+    if (seq <= 0L) {
+      return true
+    }
+    var accepted = true
+    lastReports.compute(
+      appId,
+      (_: String, prev: ClientReport) => {
+        if (prev != null && prev.instanceId == instanceId && seq <= prev.seq) {
+          accepted = false
+          prev
+        } else {
+          accepted = true
+          ClientReport(instanceId, seq)
+        }
+      })
+    accepted
   }
 
   private def rejectReason(appId: String, metricLabels: Map[String, String]): String = {
@@ -107,6 +154,7 @@ class ApplicationMetricsSource(conf: CelebornConf)
     if (masterClientMetricsEnabled) {
       removedAppIds.put(appId, System.currentTimeMillis())
     }
+    lastReports.remove(appId)
     removeAppFromMetrics(appId)
   }
 
@@ -120,7 +168,7 @@ class ApplicationMetricsSource(conf: CelebornConf)
     if (seriesCardinalityWarned.get()) {
       return
     }
-    val trackedSeries = namedGauges.size() + namedGaugesWithDetails.size() + namedCounters.size()
+    val trackedSeries = namedGauges.size() + namedTrackedMetrics.size() + namedCounters.size()
     if (trackedSeries > seriesCardinalityWarnThreshold && seriesCardinalityWarned.compareAndSet(
         false,
         true)) {
@@ -133,3 +181,6 @@ class ApplicationMetricsSource(conf: CelebornConf)
     }
   }
 }
+
+/** The most recent report accepted from an application, for staleness checks. */
+private case class ClientReport(instanceId: String, seq: Long)

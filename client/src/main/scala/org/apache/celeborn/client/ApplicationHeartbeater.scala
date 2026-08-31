@@ -18,7 +18,9 @@
 package org.apache.celeborn.client
 
 import java.util
+import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, ScheduledFuture, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 import java.util.function.Consumer
 
 import scala.collection.JavaConverters._
@@ -51,6 +53,14 @@ class ApplicationHeartbeater(
   private val reviseLostShuffles = conf.reviseLostShufflesEnabled
   private val appMetricLabels: util.Map[String, String] =
     conf.clientMetricsAppLabels.asJava
+
+  // Identifies this client process to the master. An appId can outlive the process reporting
+  // it, and a new process restarts its counters at zero, so the master needs to tell a restart
+  // apart from a counter moving backwards.
+  private val clientInstanceId: String = UUID.randomUUID().toString
+  // Advances once per heartbeat attempt, so the master can drop a delayed heartbeat that
+  // arrives after a newer one. Starts at 1; 0 means "this client does not sequence reports".
+  private val metricsSeq = new AtomicLong(0L)
 
   if (conf.metricsSystemEnable && conf.clientMetricsEnabled && appMetricLabels.isEmpty) {
     logWarning(
@@ -107,7 +117,9 @@ class ApplicationHeartbeater(
                 true,
                 if (appMetricLabels.isEmpty) java.util.Collections.emptyMap[String, ClientMetric]()
                 else clientMetrics(),
-                appMetricLabels)
+                appMetricLabels,
+                clientInstanceId,
+                metricsSeq.incrementAndGet())
             val response = requestHeartbeat(appHeartbeat)
             if (response.statusCode == StatusCode.SUCCESS) {
               logDebug("Successfully send app heartbeat.")

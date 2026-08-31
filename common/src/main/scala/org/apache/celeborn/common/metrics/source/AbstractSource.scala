@@ -30,7 +30,7 @@ import com.codahale.metrics._
 
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.internal.Logging
-import org.apache.celeborn.common.metrics.{CelebornHistogram, CelebornTimer, MetricLabels, ResettableSlidingWindowReservoir}
+import org.apache.celeborn.common.metrics.{CelebornHistogram, CelebornTimer, EvictionPolicy, MetricLabels, MetricType, ResettableSlidingWindowReservoir}
 import org.apache.celeborn.common.util.{JavaUtils, ThreadUtils, Utils}
 // Can Remove this if celeborn don't support scala211 in future
 import org.apache.celeborn.common.util.FunctionConverter._
@@ -49,23 +49,86 @@ case class NamedHistogram(name: String, histogram: Histogram, labels: Map[String
 
 case class NamedTimer(name: String, timer: Timer, labels: Map[String, String]) extends MetricLabels
 
-case class TrackedGauge(
-    namedGauge: NamedGauge[Long],
-    sum: AtomicLong,
-    perAppValues: ConcurrentHashMap[String, java.lang.Long]) {
+/**
+ * One reporting application's latest contribution to an aggregated series.
+ *
+ * `instanceId` identifies the reporting *process*, not the application. An appId can outlive
+ * the process that reports it, and a restarted process starts its counters again from zero,
+ * so without this a plain replace would step the aggregate downwards. See
+ * [[TrackedMetric.updateAppValue]].
+ */
+case class AppMetricValue(instanceId: String, value: Long)
 
-  def updateAppValue(appId: String, newValue: java.lang.Long): Unit = {
-    val oldVal =
-      if (newValue != null) {
-        perAppValues.put(appId, newValue)
-      } else {
-        perAppValues.remove(appId)
-      }
-    val delta =
-      (if (newValue != null) newValue.longValue() else 0L) -
-        (if (oldVal != null) oldVal.longValue() else 0L)
-    if (delta != 0L) sum.addAndGet(delta)
+/** How an aggregated series is published: the Prometheus type differs, so the two are distinct. */
+sealed trait ExportedMetric
+case class ExportedGauge(namedGauge: NamedGauge[Long]) extends ExportedMetric
+case class ExportedCounter(namedCounter: NamedCounter) extends ExportedMetric
+
+/**
+ * A single exported series aggregated across every application reporting it.
+ *
+ * The receive path is a *replace* of one application's absolute value, never an
+ * accumulate. That is what makes it idempotent: the heartbeat transport is at-least-once,
+ * so re-applying the same report must be a no-op. Aggregation across applications happens
+ * here rather than on receive, maintained incrementally so export stays O(1).
+ *
+ * `evictedTotal` retains the contribution of applications that have gone away, for metric
+ * types whose [[EvictionPolicy]] is `Retain`. Without it an exported counter would step
+ * downwards whenever an application timed out, and every downstream rate() would misread
+ * that as a counter reset.
+ */
+case class TrackedMetric(
+    metricType: MetricType,
+    exported: ExportedMetric,
+    liveSum: AtomicLong,
+    evictedTotal: AtomicLong,
+    perAppValues: ConcurrentHashMap[String, AppMetricValue]) {
+
+  private def retainOnEvict: Boolean = metricType.evictionPolicy == EvictionPolicy.Retain
+
+  /**
+   * Replace `appId`'s contribution with `newValue`, an absolute value as of the report.
+   *
+   * Runs inside `compute` so the map entry and the running totals move together; two
+   * concurrent reports for the same application cannot interleave into a wrong sum.
+   */
+  def updateAppValue(appId: String, instanceId: String, newValue: Long): Unit = {
+    perAppValues.compute(
+      appId,
+      (_: String, prev: AppMetricValue) => {
+        if (prev == null) {
+          liveSum.addAndGet(newValue)
+        } else {
+          // A new process for a known application: its counters restarted at zero, so bank
+          // what the previous process had reported before tracking the new one.
+          if (prev.instanceId != instanceId && retainOnEvict) {
+            evictedTotal.addAndGet(prev.value)
+          }
+          liveSum.addAndGet(newValue - prev.value)
+        }
+        AppMetricValue(instanceId, newValue)
+      })
   }
+
+  /** Drop `appId`'s contribution, banking it first if the metric type is monotonic. */
+  def removeApp(appId: String): Unit = {
+    perAppValues.computeIfPresent(
+      appId,
+      (_: String, prev: AppMetricValue) => {
+        liveSum.addAndGet(-prev.value)
+        if (retainOnEvict) {
+          evictedTotal.addAndGet(prev.value)
+        }
+        null.asInstanceOf[AppMetricValue]
+      })
+  }
+
+  /**
+   * Whether the series can be unregistered entirely. A `Retain` series holding a non-zero
+   * tombstone must stay published even with no live reporters, otherwise the counter it
+   * exports would restart from zero.
+   */
+  def isReclaimable: Boolean = perAppValues.isEmpty && evictedTotal.get() == 0L
 }
 
 abstract class AbstractSource(conf: CelebornConf, role: String)
@@ -121,8 +184,8 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
   protected val namedHistogram: ConcurrentHashMap[String, NamedHistogram] =
     JavaUtils.newConcurrentHashMap[String, NamedHistogram]()
 
-  protected val namedGaugesWithDetails: ConcurrentHashMap[String, TrackedGauge] =
-    JavaUtils.newConcurrentHashMap[String, TrackedGauge]()
+  protected val namedTrackedMetrics: ConcurrentHashMap[String, TrackedMetric] =
+    JavaUtils.newConcurrentHashMap[String, TrackedMetric]()
 
   def addTimerMetrics(namedTimer: NamedTimer): Unit = {
     val timerMetricsString = getTimerMetrics(namedTimer)
@@ -237,34 +300,69 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
         labelsWithCustomizedLabels(labels)))
   }
 
-  protected def addOrUpdateGaugeForApp(
+  /**
+   * Record one application's absolute value for an aggregated series, creating the series
+   * on first sight.
+   *
+   * `instanceId` identifies the reporting process; `value` is absolute (for a counter,
+   * cumulative since that process started) rather than a delta, which is what lets a
+   * redelivered heartbeat be a no-op.
+   */
+  protected def addOrUpdateMetricForApp(
       name: String,
       labels: Map[String, String],
       appId: String,
-      value: Long): Unit = {
+      instanceId: String,
+      value: Long,
+      metricType: MetricType): Unit = {
     val key = metricNameWithCustomizedLabels(name, labels)
-    val tracked = namedGaugesWithDetails.computeIfAbsent(
+    val tracked = namedTrackedMetrics.computeIfAbsent(
       key,
       (_: String) => {
-        val sum = new AtomicLong()
-        val gauge = metricRegistry.gauge(
-          key,
-          new GaugeSupplier[Long](() => sum.get())).asInstanceOf[Gauge[Long]]
-        TrackedGauge(
-          NamedGauge(name, gauge, labelsWithCustomizedLabels(labels)),
-          sum,
-          JavaUtils.newConcurrentHashMap[String, java.lang.Long]())
+        val liveSum = new AtomicLong()
+        val evictedTotal = new AtomicLong()
+        val total = () => liveSum.get() + evictedTotal.get()
+        val exported = metricType match {
+          case MetricType.Counter =>
+            // Published as a Prometheus counter, not a gauge: the type is what tells
+            // downstream rate()/increase() how to read it.
+            ExportedCounter(NamedCounter(
+              name,
+              metricRegistry.counter(key, new CounterSupplier(total)),
+              labelsWithCustomizedLabels(labels)))
+          case _ =>
+            ExportedGauge(NamedGauge(
+              name,
+              metricRegistry.gauge(key, new GaugeSupplier[Long](total)).asInstanceOf[Gauge[Long]],
+              labelsWithCustomizedLabels(labels)))
+        }
+        TrackedMetric(
+          metricType,
+          exported,
+          liveSum,
+          evictedTotal,
+          JavaUtils.newConcurrentHashMap[String, AppMetricValue]())
       })
-    tracked.updateAppValue(appId, value)
+    if (tracked.metricType != metricType) {
+      logWarning(s"Metric $key is already tracked as ${tracked.metricType} but was reported " +
+        s"as $metricType by application $appId; ignoring the report.")
+    } else {
+      tracked.updateAppValue(appId, instanceId, value)
+    }
   }
 
   def counters(): List[NamedCounter] = {
-    namedCounters.values().asScala.toList
+    namedCounters.values().asScala.toList ++
+      namedTrackedMetrics.values().asScala.toList.collect {
+        case TrackedMetric(_, ExportedCounter(namedCounter), _, _, _) => namedCounter
+      }
   }
 
   def gauges(): List[NamedGauge[_]] = {
     namedGauges.values().asScala.toList ++
-      namedGaugesWithDetails.values().asScala.toList.map(_.namedGauge)
+      namedTrackedMetrics.values().asScala.toList.collect {
+        case TrackedMetric(_, ExportedGauge(namedGauge), _, _, _) => namedGauge
+      }
   }
 
   def meters(): List[NamedMeter] = {
@@ -293,7 +391,8 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
 
   def gaugeExists(name: String, labels: Map[String, String]): Boolean = {
     val key = metricNameWithCustomizedLabels(name, labels)
-    namedGauges.containsKey(key) || namedGaugesWithDetails.containsKey(key)
+    namedGauges.containsKey(key) ||
+    Option(namedTrackedMetrics.get(key)).exists(_.exported.isInstanceOf[ExportedGauge])
   }
 
   def needSample(): Boolean = {
@@ -326,12 +425,12 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
   }
 
   protected def removeAppFromMetrics(appId: String): Unit = {
-    namedGaugesWithDetails.keySet().asScala.toList.foreach { key =>
-      namedGaugesWithDetails.computeIfPresent(
+    namedTrackedMetrics.keySet().asScala.toList.foreach { key =>
+      namedTrackedMetrics.computeIfPresent(
         key,
-        (_: String, tracked: TrackedGauge) => {
-          tracked.updateAppValue(appId, null)
-          if (tracked.perAppValues.isEmpty) {
+        (_: String, tracked: TrackedMetric) => {
+          tracked.removeApp(appId)
+          if (tracked.isReclaimable) {
             metricRegistry.remove(key)
             null
           } else {
@@ -702,7 +801,7 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
       namedTimers.size() +
       namedMeters.size() +
       namedGauges.size() +
-      namedGaugesWithDetails.size() +
+      namedTrackedMetrics.size() +
       namedCounters.size()
     sum
   }
@@ -756,7 +855,7 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
     metricsCleaner.shutdown()
     namedCounters.clear()
     namedGauges.clear()
-    namedGaugesWithDetails.clear()
+    namedTrackedMetrics.clear()
     namedMeters.clear()
     namedTimers.clear()
     timerMetrics.clear()
@@ -802,6 +901,10 @@ class GaugeSupplier[T](f: () => T) extends MetricRegistry.MetricSupplier[Gauge[_
 
 class MeterSupplier(f: () => Long) extends MetricRegistry.MetricSupplier[Meter] {
   override def newMetric(): Meter = new Meter { override def getCount: Long = f() }
+}
+
+class CounterSupplier(f: () => Long) extends MetricRegistry.MetricSupplier[Counter] {
+  override def newMetric(): Counter = new Counter { override def getCount: Long = f() }
 }
 
 class HistogramSupplier(val slidingWindowSize: Int)

@@ -19,6 +19,7 @@ package org.apache.celeborn.common.metrics.source
 
 import org.apache.celeborn.CelebornFunSuite
 import org.apache.celeborn.common.CelebornConf
+import org.apache.celeborn.common.metrics.MetricType
 
 class CelebornSourceSuite extends CelebornFunSuite {
 
@@ -29,12 +30,24 @@ class CelebornSourceSuite extends CelebornFunSuite {
         name: String,
         labels: Map[String, String],
         appId: String,
-        value: Long): Unit =
-      addOrUpdateGaugeForApp(name, labels, appId, value)
+        value: Long,
+        instanceId: String = "instance-1"): Unit =
+      addOrUpdateMetricForApp(name, labels, appId, instanceId, value, MetricType.Gauge)
+
+    def updateCounter(
+        name: String,
+        labels: Map[String, String],
+        appId: String,
+        value: Long,
+        instanceId: String = "instance-1"): Unit =
+      addOrUpdateMetricForApp(name, labels, appId, instanceId, value, MetricType.Counter)
 
     def removeApp(appId: String): Unit = removeAppFromMetrics(appId)
 
-    def trackedGaugeCount: Int = namedGaugesWithDetails.size()
+    def trackedGaugeCount: Int = namedTrackedMetrics.size()
+
+    def counterValue(name: String, labels: Map[String, String]): Option[Long] =
+      counters().find(_.name == name).map(_.counter.getCount)
   }
 
   private def hasLabels(
@@ -193,5 +206,45 @@ class CelebornSourceSuite extends CelebornFunSuite {
     assert(source.trackedGaugeCount == 0)
     assert(gaugeValue(source, labels, "DynamicGauge").isEmpty)
     assert(!source.gaugeExists("DynamicGauge", labels))
+  }
+
+  test("concurrent reports from many apps produce an exact sum") {
+    val source = new TestSource()
+    val labels = Map("team" -> "data-eng")
+    val apps = 16
+    val reportsPerApp = 200
+
+    // updateAppValue mutates the per-app entry and the running total together; if that pair
+    // is not atomic, concurrent reports lose updates and the sum drifts.
+    val threads = (1 to apps).map { app =>
+      new Thread(new Runnable {
+        override def run(): Unit =
+          (1 to reportsPerApp).foreach { i =>
+            source.updateCounter("ConcurrentCounter", labels, s"app-$app", i.toLong)
+          }
+      })
+    }
+    threads.foreach(_.start())
+    threads.foreach(_.join())
+
+    // Each app's last absolute report is reportsPerApp, so the sum is exact and independent
+    // of interleaving.
+    assert(source.counterValue("ConcurrentCounter", labels).contains(apps.toLong * reportsPerApp))
+  }
+
+  test("a counter tombstone keeps the series alive after every app is removed") {
+    val source = new TestSource()
+    val labels = Map("team" -> "data-eng")
+
+    source.updateCounter("BytesWritten", labels, "app-1", 1000L)
+    source.updateGauge("ActiveShuffles", labels, "app-1", 4L)
+    assert(source.trackedGaugeCount == 2)
+
+    source.removeApp("app-1")
+
+    // The gauge series is reclaimed; the counter series must not be, or the counter it
+    // exports would restart from zero.
+    assert(source.trackedGaugeCount == 1)
+    assert(source.counterValue("BytesWritten", labels).contains(1000L))
   }
 }

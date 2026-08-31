@@ -503,13 +503,27 @@ message PbHeartbeatFromApplication {
   PbHeartbeatInfo heartbeatInfo = 11;
   map<string, PbClientMetric> clientMetrics = 12;
   map<string, string> metricLabels = 13;
+  // Identifies the reporting client process, not the application. An appId can outlive the
+  // process reporting it, and a restarted process restarts its counters at zero; the master
+  // uses this to bank the previous process's totals instead of stepping the aggregate down.
+  string clientInstanceId = 14;
+  // Monotonically increasing per client process. Lets the master drop a delayed heartbeat
+  // that arrives after a newer one, which would otherwise move a counter backwards.
+  int64 metricsSeq = 15;
 }
 
 enum PbMetricType {
   GAUGE = 0;
+  COUNTER = 1;
+  // Reserved for cumulative bucket histograms. Adding the payload for these is a new field
+  // on PbClientMetric, which is wire-compatible; the blocker is client-side, since
+  // CelebornHistogram/CelebornTimer are reset on read and so cannot report cumulative state.
+  // HISTOGRAM = 2;
 }
 
 message PbClientMetric {
+  // Always absolute state, never a delta: for a counter, the cumulative total since the
+  // reporting client process started.
   int64 value = 1;
   PbMetricType type = 2;
 }

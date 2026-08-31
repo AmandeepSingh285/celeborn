@@ -263,6 +263,7 @@ class UtilsSuite extends CelebornFunSuite {
   test("HeartbeatFromApplication carries client metrics through pb serde") {
     val clientMetrics = new util.HashMap[String, ClientMetric]()
     clientMetrics.put("ClientExcludedWorkerCount", ClientMetric(2L, MetricType.Gauge))
+    clientMetrics.put("ClientBytesWritten", ClientMetric(4096L, MetricType.Counter))
 
     val metricLabels = new util.HashMap[String, String]()
     metricLabels.put("env", "prod")
@@ -279,13 +280,17 @@ class UtilsSuite extends CelebornFunSuite {
       new util.ArrayList(),
       shouldResponse = true,
       clientMetrics = clientMetrics,
-      metricLabels = metricLabels)
+      metricLabels = metricLabels,
+      clientInstanceId = "instance-abc",
+      metricsSeq = 7L)
 
     val heartbeatTrans = Utils.fromTransportMessage(Utils.toTransportMessage(heartbeat))
       .asInstanceOf[HeartbeatFromApplication]
 
     assert(heartbeatTrans.clientMetrics == clientMetrics)
     assert(heartbeatTrans.metricLabels == metricLabels)
+    assert(heartbeatTrans.clientInstanceId == "instance-abc")
+    assert(heartbeatTrans.metricsSeq == 7L)
   }
 
   test("validate number of client/server netty threads") {

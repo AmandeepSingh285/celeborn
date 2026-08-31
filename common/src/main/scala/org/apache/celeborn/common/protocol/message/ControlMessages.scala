@@ -393,7 +393,9 @@ object ControlMessages extends Logging {
       shouldResponse: Boolean = false,
       clientMetrics: util.Map[String, ClientMetric] =
         java.util.Collections.emptyMap[String, ClientMetric](),
-      metricLabels: util.Map[String, String] = java.util.Collections.emptyMap[String, String]())
+      metricLabels: util.Map[String, String] = java.util.Collections.emptyMap[String, String](),
+      clientInstanceId: String = "",
+      metricsSeq: Long = 0L)
     extends MasterRequestMessage
 
   case class HeartbeatFromApplicationResponse(
@@ -875,7 +877,9 @@ object ControlMessages extends Logging {
           requestId,
           shouldResponse,
           clientMetrics,
-          metricLabels) =>
+          metricLabels,
+          clientInstanceId,
+          metricsSeq) =>
       val payload = PbHeartbeatFromApplication.newBuilder()
         .setAppId(appId)
         .setRequestId(requestId)
@@ -891,10 +895,13 @@ object ControlMessages extends Logging {
         .putAllClientMetrics(clientMetrics.asScala.map { case (name, metric) =>
           val pbType = metric.metricType match {
             case MetricType.Gauge => PbMetricType.GAUGE
+            case MetricType.Counter => PbMetricType.COUNTER
           }
           name -> PbClientMetric.newBuilder().setValue(metric.value).setType(pbType).build()
         }.asJava)
         .putAllMetricLabels(metricLabels)
+        .setClientInstanceId(clientInstanceId)
+        .setMetricsSeq(metricsSeq)
         .build().toByteArray
       new TransportMessage(MessageType.HEARTBEAT_FROM_APPLICATION, payload)
 
@@ -1386,12 +1393,16 @@ object ControlMessages extends Logging {
                 pbMetric.getType match {
                   case PbMetricType.GAUGE =>
                     Some(name -> ClientMetric(pbMetric.getValue, MetricType.Gauge))
+                  case PbMetricType.COUNTER =>
+                    Some(name -> ClientMetric(pbMetric.getValue, MetricType.Counter))
                   case unknown =>
                     logWarning(s"Unknown PbMetricType $unknown for metric $name, skipping")
                     None
                 }
             }.asJava),
-          new util.HashMap[String, String](pbHeartbeatFromApplication.getMetricLabelsMap))
+          new util.HashMap[String, String](pbHeartbeatFromApplication.getMetricLabelsMap),
+          pbHeartbeatFromApplication.getClientInstanceId,
+          pbHeartbeatFromApplication.getMetricsSeq)
 
       case HEARTBEAT_FROM_APPLICATION_RESPONSE_VALUE =>
         val pbHeartbeatFromApplicationResponse =

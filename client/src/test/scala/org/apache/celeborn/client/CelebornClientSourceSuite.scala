@@ -39,4 +39,33 @@ class CelebornClientSourceSuite extends CelebornFunSuite {
     assert(snapshot(CelebornClientSource.EXCLUDED_WORKER_COUNT).value == 5)
     assert(snapshot(CelebornClientSource.EXCLUDED_WORKER_COUNT).metricType == MetricType.Gauge)
   }
+
+  test("counters registered on the source are reflected in metrics and snapshot") {
+    val source = new CelebornClientSource(new CelebornConf())
+
+    source.addCounter("ClientBytesWritten")
+    source.incCounter("ClientBytesWritten", 1024)
+
+    val metrics = source.getMetrics
+    assert(metrics.contains("metrics_ClientBytesWritten_Count"))
+
+    val snapshot = source.getMetricsSnapshot()
+    assert(snapshot("ClientBytesWritten").value == 1024)
+    assert(snapshot("ClientBytesWritten").metricType == MetricType.Counter)
+  }
+
+  test("a counter snapshot is cumulative, not a delta since the last snapshot") {
+    val source = new CelebornClientSource(new CelebornConf())
+
+    source.addCounter("ClientBytesWritten")
+    source.incCounter("ClientBytesWritten", 100)
+    assert(source.getMetricsSnapshot()("ClientBytesWritten").value == 100)
+
+    // Taking a snapshot must not reset the counter: the master relies on every report
+    // carrying the absolute total so that a redelivered or dropped heartbeat is harmless.
+    assert(source.getMetricsSnapshot()("ClientBytesWritten").value == 100)
+
+    source.incCounter("ClientBytesWritten", 50)
+    assert(source.getMetricsSnapshot()("ClientBytesWritten").value == 150)
+  }
 }
