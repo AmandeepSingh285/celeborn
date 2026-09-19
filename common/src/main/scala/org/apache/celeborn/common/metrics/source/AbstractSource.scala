@@ -237,6 +237,8 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
         labelsWithCustomizedLabels(labels)))
   }
 
+  protected def isAppRemoved(appId: String): Boolean = false
+
   protected def addOrUpdateGaugeForApp(
       name: String,
       labels: Map[String, String],
@@ -247,6 +249,16 @@ abstract class AbstractSource(conf: CelebornConf, role: String)
       key,
       new java.util.function.BiFunction[String, TrackedGauge, TrackedGauge] {
         override def apply(k: String, existing: TrackedGauge): TrackedGauge = {
+          if (isAppRemoved(appId)) {
+            if (existing != null) {
+              existing.updateAppValue(appId, null)
+              if (existing.perAppValues.isEmpty) {
+                metricRegistry.remove(key)
+                return null
+              }
+            }
+            return existing
+          }
           val tracked =
             if (existing != null) {
               existing
